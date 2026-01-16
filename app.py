@@ -189,3 +189,123 @@ def insert_portarias_at_marker(
                 txt = "" if txt is None else str(txt)  # texto completo, sem resumo
 
                 if not (num or txt.strip()):
+                    continue
+
+                # Título com número
+                head = p.insert_paragraph_before(f"Portaria nº {num}".strip())
+                head.style = doc.styles["Normal"]
+                head.paragraph_format.space_after = Pt(0)
+
+                # Corpo com texto completo (linhas viram parágrafos)
+                lines = txt.splitlines() if txt else [""]
+                for line in lines:
+                    body = p.insert_paragraph_before(line)
+                    body.style = doc.styles["Normal"]
+                    body.paragraph_format.space_after = Pt(0)
+
+                # Espaço entre portarias
+                sep = p.insert_paragraph_before("")
+                sep.paragraph_format.space_after = Pt(space_after_pt)
+
+            return True
+
+    return False
+
+
+# =========================
+# Streamlit UI
+# =========================
+st.set_page_config(page_title="Minuta — Preenchimento + Portarias", page_icon="📄", layout="centered")
+st.title("Preencher Minuta (DOCX) com Planilha (XLSX) + Portarias em ordem crescente")
+
+docx_file = st.file_uploader("Minuta em branco (DOCX)", type=["docx"])
+xlsx_file = st.file_uploader("Dados (XLSX)", type=["xlsx"])
+
+with st.expander("Configurações", expanded=True):
+    marker_portarias = st.text_input(
+        "Marcador do bloco de Portarias no DOCX",
+        value=DEFAULT_MARKER_PORTARIAS,
+        help="Na sua minuta está como 'INSERIR CAMPO PORTARIAS'.",
+    )
+    space_after = st.number_input("Espaçamento entre portarias (pt)", min_value=0, max_value=48, value=12, step=1)
+
+if not docx_file or not xlsx_file:
+    st.stop()
+
+try:
+    # 1) Ler planilha
+    df = pd.read_excel(BytesIO(xlsx_file.getvalue()), dtype=str).fillna("")
+    df.columns = df.columns.astype(str).str.strip()
+
+    # 2) Normalizar colunas
+    df_norm = df.copy()
+    df_norm.columns = [normalize_key(c) for c in df_norm.columns]
+    for c in df_norm.columns:
+        df_norm[c] = df_norm[c].map(sstr)
+
+    # 3) Aplicar aliases (para garantir NUMERO_PORTARIA / TEXTO_PORTARIA etc.)
+    df_norm = apply_aliases(df_norm)
+    cols_norm = list(df_norm.columns)
+
+    # 4) Registros
+    records = df_norm.to_dict(orient="records")
+    if not records:
+        raise ValueError("Planilha sem registros.")
+
+    # 5) Mapping para placeholders gerais: usa a primeira linha
+    mapping = {k: sstr(v) for k, v in records[0].items()}
+
+    # 6) Portarias: filtra e ordena por NUMERO_PORTARIA
+    if "NUMERO_PORTARIA" in cols_norm:
+        portarias = [r for r in records if sstr(r.get("NUMERO_PORTARIA", "")) or sstr(r.get("TEXTO_PORTARIA", ""))]
+        portarias_sorted = sorted(portarias, key=lambda r: parse_order_value(r.get("NUMERO_PORTARIA", "")))
+    else:
+        portarias_sorted = []
+
+    # 7) Abrir DOCX e preencher
+    doc = Document(BytesIO(docx_file.getvalue()))
+
+    replace_placeholders(doc, mapping)
+
+    # 8) Inserir portarias (se houver colunas e marcador existir)
+    inserted = False
+    if portarias_sorted and ("TEXTO_PORTARIA" in cols_norm):
+        inserted = insert_portarias_at_marker(
+            doc,
+            marker=marker_portarias,
+            portarias_sorted=portarias_sorted,
+            num_key="NUMERO_PORTARIA",
+            text_key="TEXTO_PORTARIA",
+            space_after_pt=int(space_after),
+        )
+
+    # 9) Salvar saída
+    out = BytesIO()
+    doc.save(out)
+    out_bytes = out.getvalue()
+
+    st.success("Minuta gerada com sucesso.")
+
+    if portarias_sorted:
+        st.caption(f"Portarias detectadas: {len(portarias_sorted)} (ordenadas crescente por NUMERO_PORTARIA).")
+    else:
+        st.warning("Nenhuma portaria detectada na planilha (coluna NUMERO_PORTARIA/TEXTO_PORTARIA vazias ou ausentes).")
+
+    if not inserted:
+        st.info(
+            f"Não encontrei o marcador '{marker_portarias}' no corpo do documento. "
+            f"Na sua minuta ele existe como texto literal. Verifique se está idêntico."
+        )
+
+    with st.expander("Colunas detectadas (normalizadas)", expanded=False):
+        st.code(", ".join(cols_norm))
+
+    st.download_button(
+        "Baixar DOCX preenchido",
+        data=out_bytes,
+        file_name="Minuta_Preenchida.docx",
+        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+
+except Exception as e:
+    st.error(f"Erro: {e}")
